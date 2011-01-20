@@ -1,0 +1,22 @@
+<../../mkconfig
+
+TARG=\
+	ttffs.dis\
+
+SYSMODULES=\
+	arg.m\
+	bufio.m\
+	daytime.m\
+	draw.m\
+	freetype.m\
+	keyring.m\
+	readdir.m\
+	string.m\
+	styx.m\
+	styxservers.m\
+	sys.m\
+	tables.m\
+
+DISBIN=$ROOT/dis
+
+<$ROOT/mkfiles/mkdis

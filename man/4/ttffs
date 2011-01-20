@@ -1,0 +1,64 @@
+.TH TTFFS 4
+.SH NAME
+ttffs \- serve ttf fonts as Inferno (sub)fonts
+.SH SYNOPSIS
+.B ttffs
+[
+.B -d
+] [
+.BI -r " xdpi ydpi"
+]
+.I fontpath
+.SH DESCRIPTION
+.I Ttffs
+serves
+.I TrueType
+font files as Inferno font/subfont files in arbitrary sizes, over 9P2000.
+When a file of the form 
+.IR fontname . size .font
+is walked, the file
+.IR fontname .ttf
+in
+.I fontpath
+is opened, parsed and cached for subsequent.
+.I Size
+must be a number greater than 1.
+The
+.IR .font -file
+references subfonts of the form
+.IR fontname . size . index ,
+where
+.I index
+is a number indicating a glyph range.
+.PP
+The
+.I size
+of the font and the dots per inch
+.RI ( dpi )
+determine the pixel sizes for the generated (sub)fonts.  This makes font sizes independent of the display used.  The
+horizontal
+.I xdpi
+and vertical
+.I ydpi
+can be set by option
+.BR -r ,
+and defaults to ``96 96''.
+.PP
+Option
+.B -d
+enables debug printing.
+.SH EXAMPLES
+.EX
+# ensure /fonts/ttf/VeraMono.ttf exists
+mount -a {ttffs /fonts/ttf} /fonts/ttf
+wm/sh -f /fonts/ttf/VeraMono.10.font
+.EE
+.SH SOURCE
+.B /appl/cmd/ttffs.b
+.SH FILES
+.B /fonts/*
+.SH SEE ALSO
+.IR draw-font (2),
+.IR fonts (6).
+.SH BUGS
+No kerning or subpixel rendering is supported.  Only 8-bit greyscale anti-aliased fonts are served.

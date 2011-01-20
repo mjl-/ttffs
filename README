@@ -1,0 +1,46 @@
+# status
+
+needs testing.
+
+
+# intro
+
+ttffs is a styx server, serving ttf files in any size as inferno
+fonts.  the styx serves serves a seemingly empty directory.  but
+walks to files of the form "name.<size>.font" succeed if "name.ttf"
+exists and size is numeric > 1.  the file is a normal inferno font
+and points to subfonts named "name.<size>.<index>", with index a
+numeric index for a glyph range.  these subfonts are also synthesized
+by ttffs on demand.
+
+see the manual page for more information and limitations.
+
+
+# install
+
+make sure $ROOT is set.  now "mk install" to compile and install the
+files.
+
+when building from within inferno, insert SYSHOST=Inferno and ROOT=
+in the mk invocations to override the values in the mkconfig.
+
+
+# latest version
+
+the latest version can be found at:
+
+    http://www.ueber.net/code/r/ttffs
+
+
+# licence & author
+
+all files are in the public domain.  this code has been written by
+mechiel lukkien, reachable at mechiel@ueber.net.
+
+
+# todo
+
+- test
+- keep track of fid references to Ttfsizes, and drop cached data when last reference goes
+- see what Face.index means.  perhaps multiple faces in one ttf file?
+- think of generating glyphs for ranges 0x1-0x1f with ascii names drawn
