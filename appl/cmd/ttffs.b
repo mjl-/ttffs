@@ -6,9 +6,9 @@ implement Ttffs;
 # subfonts contain at most 128 glyphs.
 # at first read of a font, it is parsed and its glyph ranges determined.
 #
-# for each font file ("name.ttf") the following files are served:
-# name.<size>.font
-# name.<size>.<index>
+# for each font file (fontpath/*.ttf) the following files are served:
+# <name>.<style>.<size>.font
+# <name>.<style>.<size>.<index>
 #
 # the second form are subfonts, index starts at 1.  index 1 always has the single char 0.
 
@@ -47,39 +47,49 @@ Ttffs: module {
 };
 
 dflag: int;
-wdpi := hdpi := 96;
-fontpath: string;
+fontpath := "/fonts/ttf";
+mtpt: con "/mnt/ft";
 
 disp: ref Display;
 srv: ref Styxserver;
+styles := array[] of {"r", "i", "b", "ib"};
 
-idgen := 1;
+Qroot, Qindex: con iota;
+idgen := 2;
 
-Ttf: adt {
-	name:	string;
-	f:	ref Face;
-	path:	string;
+Font: adt {
+	sane,
+	family:	string;
 	ranges:	array of ref (int, int);	# sorted, start-end inclusive
-	sizes:	cyclic ref Table[cyclic ref Ttfsize];
+	styles:	cyclic array of ref Style;	# indexed by Face.style
 };
 
-Ttfsize: adt {
-	id:	int;	# qid.path.  subfonts are id+1+i.
-	ttf:	ref Ttf;
-	range:	int;	# index for Ttf.ranges.  0 is .font, 1 is first in range
+Style: adt {
+	f:	ref Font;
+	dir:	ref Sys->Dir;
+	path:	string;
+	fc:	ref Face;
+	sizes:	cyclic ref Table[cyclic ref Size];	# size
+};
+
+Size: adt {
+	id:	int;	# qid.path.  subfonts are id+Size.range
+	st:	cyclic ref Style;
+	range:	int;	# index for Font.ranges.  0 is .font, 1 is first in range
 	size:	int;
 	dat:	array of byte;
+	nuse:	int;
 };
 
-fonts: ref Strhash[ref Ttf]; # name
-ttfsizes: ref Table[ref Ttfsize]; # qid.path
+fonts: ref Strhash[ref Font];	# family
+sanefonts: ref Strhash[ref Font];  # sane name
+sizes: ref Table[ref Size];	# qid.path
 
 
 init(ctxt: ref Draw->Context, args: list of string)
 {
 	sys = load Sys Sys->PATH;
-	disp = ctxt.display;
-	if(disp == nil)
+	if(ctxt == nil || (disp = ctxt.display) == nil)
 		fail("no display");
 	draw = load Draw Draw->PATH;
 	arg := load Arg Arg->PATH;
@@ -95,50 +105,93 @@ init(ctxt: ref Draw->Context, args: list of string)
 	readdir = load Readdir Readdir->PATH;
 	tables = load Tables Tables->PATH;
 
-	sys->pctl(Sys->NEWPGRP|Sys->FORKNS, nil);
+	sys->pctl(Sys->NEWPGRP, nil);
+
+	Mflag := 0;
 
 	arg->init(args);
-	arg->setusage(arg->progname()+" [-d] [-r xdpi ydpi] fontpath");
+	arg->setusage(arg->progname()+" [-dM] [-p fontpath]");
 	while((c := arg->opt()) != 0)
 		case c {
 		'd' =>	dflag++;
-		'r' =>	wdpi = int arg->arg();
-			hdpi = int arg->arg();
+		'p' =>	fontpath = arg->arg();
+		'M' =>	Mflag++;
 		* =>	arg->usage();
 		}
 	args = arg->argv();
-	if(len args != 1)
+	if(args != nil)
 		arg->usage();
-	fontpath = hd args;
 
 	fonts = fonts.new(11, nil);
-	ttfsizes = ttfsizes.new(11, nil);
+	sanefonts = sanefonts.new(11, nil);
+	sizes = sizes.new(11, nil);
+
+	fds := array[2] of ref Sys->FD;
+	fd := sys->fildes(0);
+	if(!Mflag) {
+		if(sys->pipe(fds) < 0)
+			fail(sprint("pipe: %r"));
+		fd = fds[0];
+	}
 
 	navc := chan of ref Navop;
 	spawn navigator(navc);
 	msgc: chan of ref Tmsg;
-	(msgc, srv) = Styxserver.new(sys->fildes(0), Navigator.new(navc), big 0);
-	main(msgc);
-	killgrp(pid());
+	(msgc, srv) = Styxserver.new(fd, Navigator.new(navc), big Qroot);
+
+	if(Mflag)
+		return main(msgc);
+
+	spawn main(msgc);
+	if(sys->mount(fds[1], nil, mtpt, sys->MAFTER, nil) < 0)
+		fail(sprint("mount: %r"));
+	return;
 }
 
-openttf(path, name: string): (ref Ttf, string)
+xwarn(s: string): array of ref (int, int)
 {
-	fc := ft->newface(path, 0);
-	if(fc == nil)
-		return (nil, sprint("%r"));
+	warn(s);
+	return nil;
+}
 
-	say(sprint("have face, nfaces=%d index=%d style=%d height=%d ascent=%d familyname=%q stylename=%q",
-		fc.nfaces, fc.index, fc.style, fc.height, fc.ascent, fc.familyname, fc.stylename));
+# read cached glyph ranges available in the font
+readranges(path: string, mtime: int): array of ref (int, int)
+{
+	fd := sys->open(path, Sys->OREAD);
+	if(fd == nil)
+		return xwarn(sprint("open %q: %r", path));
+	(ok, d) := sys->fstat(fd);
+	if(ok != 0)
+		return xwarn(sprint("fstat %q: %r", path));
+	if(d.mtime <= mtime)
+		return xwarn(sprint("%q: older than ttf, ignoring", path));
+	if(sys->readn(fd, buf := array[int d.length] of byte, len buf) != len buf)
+		return xwarn(sprint("readn %q: %r", path));
+	s := string buf;
+	r: list of ref (int, int);
+	for(l := sys->tokenize(s, "\n").t1; l != nil; l = tl l) {
+		x := sys->tokenize(hd l, " ").t1;
+		if(len x != 2)
+			return xwarn(sprint("%q: bad glyph range line: %q", path, hd l));
+		(a, rem0) := str->toint(hd x, 10);
+		(b, rem1) := str->toint(hd tl x, 10);
+		if(rem0 != nil || rem1 != nil || b < a || b > 64*1024 || r != nil && a <= (hd r).t1)
+			return xwarn(sprint("%q: invalid glyph range: %q", path, hd l));
+		r = ref (a, b)::r;
+	}
+	return l2a(rev(r));
+}
 
-	ranges := list of {ref (0, 0)};
+genranges(f: ref Face): array of ref (int, int)
+{
+	r := list of {ref (0, 0)};
 	max := 64*1024;
 	i := 1;
 	while(i < max) {
-		for(; i < max && !fc.haschar(i); i++)
+		for(; i < max && !f.haschar(i); i++)
 			{}
 		s := i;
-		for(; i < max && fc.haschar(i); i++)
+		for(; i < max && f.haschar(i); i++)
 			{}
 		e := i;
 		while(s < e) {
@@ -146,24 +199,133 @@ openttf(path, name: string): (ref Ttf, string)
 			if(n > 128)
 				n = 128;
 			if(dflag > 1) say(sprint("range %d-%d", s, s+n-1));
-			ranges = ref (s, s+n-1)::ranges;
+			r = ref (s, s+n-1)::r;
 			s += n;
 		}
 	}
-
-	f := ref Ttf(name, fc, path, l2a(rev(ranges)), nil);
-	f.sizes = f.sizes.new(11, nil);
-	return (f, nil);
+	return l2a(rev(r));
 }
 
-mkname(f: ref Ttfsize): string
+indexdat: array of byte;
+indexmtime: int;
+mkindex(): array of byte
 {
-	if(f.range == 0)
-		return sprint("%s.%d.font", f.ttf.name, f.size);
-	return sprint("%s.%d.%d", f.ttf.name, f.size, f.range);
+say("mkindex0");
+	(ok, dir) := sys->stat(fontpath);
+	if(ok != 0) {
+		warn(sprint("stat %q: %r", fontpath));
+		return nil;
+	}
+	if(indexdat != nil && indexmtime == dir.mtime)
+		return indexdat;
+
+say("mkindex1");
+	nfonts := fonts.new(11, nil);
+	nsanefonts := sanefonts.new(11, nil);
+	nsizes := sizes.new(11, nil);
+
+	(a, n) := readdir->init(fontpath, Readdir->NONE);
+	if(n < 0)
+		return nil;
+	for(i := 0; i < len a; i++) {
+		if(!suffix(".ttf", a[i].name) && !suffix(".otf", a[i].name))
+			continue;
+		name := a[i].name;
+		name = name[:len name-len ".ttf"];
+
+		path := sprint("%s/%s", fontpath, a[i].name);
+		fc := ft->newface(path, 0);
+		if(fc == nil) {
+			warn(sprint("newface %q: %r", path));
+			continue;
+		}
+
+if(dflag) say(sprint("have face, nfaces=%d index=%d style=%d height=%d ascent=%d familyname=%q stylename=%q",
+			fc.nfaces, fc.index, fc.style, fc.height, fc.ascent, fc.familyname, fc.stylename));
+
+		rpath := sprint("%s/ranges.%s", fontpath, name);
+		ranges := readranges(rpath, a[i].mtime);
+		if(ranges == nil) {
+			ranges = genranges(fc);
+			s := "";
+			for(j := 0; j < len ranges; j++)
+				s += sprint("%d %d\n", ranges[j].t0, ranges[j].t1);
+			fd := sys->create(rpath, Sys->OWRITE, 8r666);
+			if(fd == nil || sys->write(fd, buf := array of byte s, len buf) != len buf)
+				warn(sprint("create or write %q: %r", rpath));
+		}
+
+		f := nfonts.find(fc.familyname);
+		if(f == nil) {
+			sane := sanitize(fc.familyname);
+			while(nsanefonts.find(sane) != nil)
+				sane += "0";
+			f = ref Font(sane, fc.familyname, ranges, array[len styles] of ref Style);
+			nfonts.add(f.family, f);
+			nsanefonts.add(f.sane, f);
+		} else if(f.styles[fc.style] != nil) {
+			warn(sprint("duplicate style %#q", styles[fc.style]));
+			continue;
+		}
+		st := ref Style(f, ref dir, path, fc, nil);
+		st.sizes = st.sizes.new(11, nil);
+		f.styles[st.fc.style] = st;
+		for(l := tabitems(st.sizes); l != nil; l = tl l) {
+			(nil, size) := *hd l;
+			nsizes.add(size.id, size);
+		}
+	}
+	s := "";
+	for(l := strtabitems(nfonts); l != nil; l = tl l) {
+		f := (hd l).t1;
+		st := "";
+		for(i = 0; i < len styles; i++)
+			if(f.styles[i] != nil)
+				st += ","+styles[i];
+		s += sprint("%q %q\n", f.sane, sprint(".%s.%s.2-", f.family, st[1:]));
+	}
+
+	# ensure we don't mkindex immediately after writing ranges files
+	(ok, dir) = sys->stat(fontpath);
+	if(ok != 0) {
+		warn(sprint("stat: %q: %r", fontpath));
+		return nil;
+	}
+
+	fonts = nfonts;
+	sanefonts = nsanefonts;
+	sizes = nsizes;
+	indexdat = array of byte s;
+	indexmtime = dir.mtime;
+	return indexdat;
 }
 
-mkdat(f: ref Ttfsize): array of byte
+sanitize(s: string): string
+{
+	s = str->tolower(s);
+	r: string;
+	for(i := 0; i < len s; i++)
+		case c := s[i] {
+		' ' or '\t' or '-' =>
+			if(r != nil && r[len r-1] != '-')
+				r[len r] = '-';
+		'.' =>	{}
+		* =>	r[len r] = c;
+		}
+	return r;
+}
+
+mkname(s: ref Size): string
+{
+	st := s.st;
+	fc := st.fc;
+	f := st.f;
+	if(s.range == 0)
+		return sprint("%s.%s.%d.font", f.sane, styles[fc.style], s.size);
+	return sprint("%s.%s.%d.%d", f.sane, styles[fc.style], s.size, s.range);
+}
+
+mkdat(f: ref Size): array of byte
 {
 	if(f.dat == nil) {
 		if(f.range == 0)
@@ -174,23 +336,24 @@ mkdat(f: ref Ttfsize): array of byte
 	return f.dat;
 }
 
-mkfont(f: ref Ttfsize): array of byte
+mkfont(sz: ref Size): array of byte
 {
-	fc := f.ttf.f;
-	fc.setcharsize(f.size<<6, wdpi, hdpi);
+	f := sz.st.f;
+	fc := sz.st.fc;
+	fc.setcharsize(sz.size<<6, 0, 0);
 	s := sprint("%d %d\n", fc.height, fc.ascent);
-	for(i := 0; i < len f.ttf.ranges; i++) {
-		(a, b) := *f.ttf.ranges[i];
-		s += sprint("0x%04X\t0x%04X\t%q\n", a, b, sprint("%s.%d.%d", f.ttf.name, f.size, i+1));
+	for(i := 0; i < len f.ranges; i++) {
+		(a, b) := *f.ranges[i];
+		s += sprint("0x%04x\t0x%04x\t%q\n", a, b, sprint("%s.%s.%d.%d", f.sane, styles[fc.style], sz.size, i+1));
 	}
 	return array of byte s;
 }
 
-mksubfont(f: ref Ttfsize): array of byte
+mksubfont(sz: ref Size): array of byte
 {
-	(s, l) := *f.ttf.ranges[f.range-1];
-	fc := f.ttf.f;
-	fc.setcharsize(f.size<<6, wdpi, hdpi);
+	(s, l) := *sz.st.f.ranges[sz.range-1];
+	fc := sz.st.fc;
+	fc.setcharsize(sz.size<<6, 0, 0);
 
 	imgs := array[l+1-s] of ref Image;
 	n := l+1-s;
@@ -202,7 +365,7 @@ mksubfont(f: ref Ttfsize): array of byte
 		g := fc.loadglyph(c);
 		if(g == nil)
 			fail(sprint("no glyph for %c (%#x)", c, c));
-		say(sprint("glyph %#x, width=%d height=%d top=%d left=%d advance=%d,%d", c, g.width, g.height, g.top, g.left, g.advance.x>>6, g.advance.y>>6));
+if(dflag) say(sprint("glyph %#x, width=%d height=%d top=%d left=%d advance=%d,%d", c, g.width, g.height, g.top, g.left, g.advance.x>>6, g.advance.y>>6));
 		r := Rect((0,0), (g.width, fc.height));
 		img := imgs[i] = disp.newimage(r, Draw->GREY8, 0, Draw->Black);
 		gr: Rect;
@@ -233,14 +396,14 @@ mksubfont(f: ref Ttfsize): array of byte
 			img := imgs[i];
 		buf[o++] = byte (x>>0);
 		buf[o++] = byte (x>>8);
-		buf[o++] = byte 0;  # top
-		buf[o++] = byte fc.height;  # bottom
-		buf[o++] = byte left[i];  # left
+		buf[o++] = byte 0;		# top
+		buf[o++] = byte fc.height;	# bottom
+		buf[o++] = byte left[i];	# left
 		if(img == nil) {
-			buf[o++] = byte 0;  # width
+			buf[o++] = byte 0;	# width
 			break;
 		}
-		buf[o++] = byte advance[i];  # width
+		buf[o++] = byte advance[i];	# width
 		r := fontr;
 		r.min.x = x;
 		fontimg.draw(r, disp.white, img, Point(0,0));
@@ -256,15 +419,43 @@ mksubfont(f: ref Ttfsize): array of byte
 
 main(msgc: chan of ref Tmsg)
 {
+	sys->pctl(Sys->FORKNS, nil);
+more:
 	for(;;) {
 		mm := <-msgc;
 		if(mm == nil)
-			return;
+			break more;
 		pick m := mm {
 		Readerror =>
-			return warn("read: "+m.error);
+			warn("read: "+m.error);
+			break more;
 		* =>
 			handle(mm);
+			pick x := mm {
+			Clunk or
+			Remove =>
+				cacheclean();
+			}
+		}
+	}
+	killgrp(pid());
+}
+
+cacheclean()
+{
+	for(k := tabitems(sizes); k != nil; k = tl k)
+		(hd k).t1.nuse = 0;
+	for(l := srv.allfids(); l != nil; l = tl l) {
+		fid := hd l;
+		f := sizes.find(int fid.path);
+		if(fid.isopen)
+			f.nuse++;
+	}
+	for(k = tabitems(sizes); k != nil; k = tl k) {
+		sz := (hd k).t1;
+		if(sz.nuse == 0 && sz.dat != nil) {
+			if(dflag) say(sprint("freeing %s.%s.%d.%d", sz.st.f.sane, styles[sz.st.fc.style], sz.size, sz.range));
+			sz.dat = nil;
 		}
 	}
 }
@@ -284,70 +475,85 @@ navigate(op: ref Navop)
 {
 	pick x := op {
 	Stat =>
-		if(x.path == big 0)
-			return navreply(x, ref dir(".", 8r555|Sys->DMDIR, big 0, 0), nil);
-		f := ttfsizes.find(int x.path);
-		if(f == nil)
-			return navreply(x, nil, sprint("missing Ttfsize for qid.path %bd/%#bx", x.path, x.path));
-		d := ref dir(mkname(f), 8r444, x.path, len mkdat(f));
-		navreply(x, d, nil);
+		case int x.path {
+		Qroot =>
+			navreply(x, ref dirroot(), nil);
+		Qindex =>
+			navreply(x, ref dirindex(), nil);
+		* =>
+			mkindex();  # ensure up to date index
+			f := sizes.find(int x.path);
+			if(f == nil)
+				return navreply(x, nil, sprint("missing Size for qid.path %bd/%#bx", x.path, x.path));
+			d := ref dir(mkname(f), int x.path, 8r444, len mkdat(f), 0);
+			navreply(x, d, nil);
+		}
 	Walk =>
 		if(x.name == "..")
-			return navreply(x, ref dir(".", 8r555|Sys->DMDIR, big 0, 0), nil);
-		if(x.path != big 0)
+			return navreply(x, ref dirroot(), nil);
+		if(x.path != big Qroot)
 			return navreply(x, nil, Enotfound);
 
-		name, size, suf: string;
+		if(x.name == "index")
+			return navreply(x, ref dirindex(), nil);
+
+		mkindex();  # ensure up to date index
+		name, style, size, suf: string;
 		s := x.name;
-		(name, s) = str->splitstrl(s, ".");
+		(s, suf) = str->splitstrr(s, ".");
 		if(s != nil)
-			(size, s) = str->splitstrl(s[1:], ".");
-		if(s != nil) {
-			(suf, s) = str->splitstrl(s[1:], ".");
-			if(s != nil)
-				return navreply(x, nil, Enotfound);
-		} else
+			(s, size) = str->splitstrr(s[:len s-1], ".");
+		if(s != nil)
+			(name, style) = str->splitstrr(s[:len s-1], ".");
+		if(name == nil)
 			return navreply(x, nil, Enotfound);
+		name = name[:len name-1];
+if(dflag) say(sprint("walk, name %q, style %q, size %q, suf %q", name, style, size, suf));
 
 		# format is good
-		f := fonts.find(name);
-		if(f == nil) {
-			p := sprint("%s/%s.ttf", fontpath, name);
-			(ttf, err) := openttf(p, name);
-			if(err != nil)
-				return navreply(x, nil, err);
-			fonts.add(ttf.name, ttf);
-			f = ttf;
-		}
-		(sz, rem) := str->toint(size, 10);
+		f := sanefonts.find(name);
+		if(f == nil)
+			return navreply(x, nil, "no such font");
+		sti := find(styles, style);
+		if(sti < 0 || f.styles[sti] == nil)
+			return navreply(x, nil, "no such style");
+		(szs, rem) := str->toint(size, 10);
 		if(rem != nil)
 			return navreply(x, nil, Enotfound);
-		if(sz <= 1)
-			return navreply(x, nil, "requested font size too small");
+		if(szs <= 1)
+			return navreply(x, nil, "no such size");
 
 		r := 0;
 		if(suf != "font") {
 			(r, rem) = str->toint(suf, 10);
 			if(rem != nil || r <= 0 || r > len f.ranges)
-				return navreply(x, nil, Enotfound);
+				return navreply(x, nil, "no such range");
 		}
 
-		say(sprint("walk, r %d", r));
-
-		xf := f.sizes.find(sz);
-		if(xf == nil) {
-			xf = ref Ttfsize(idgen++, f, 0, sz, nil);
-			ttfsizes.add(xf.id, xf);
+		st := f.styles[sti];
+		xsz := st.sizes.find(szs);
+		if(xsz == nil) {
+			xsz = ref Size(idgen++, st, 0, szs, nil, 0);
+			sizes.add(xsz.id, xsz);
 			for(i := 0; i < len f.ranges; i++) {
-				sf := ref Ttfsize(idgen++, f, 1+i, sz, nil);
-				ttfsizes.add(sf.id, sf);
+				ssz := ref Size(idgen++, st, 1+i, szs, nil, 0);
+				sizes.add(ssz.id, ssz);
 			}
-			f.sizes.add(sz, xf);
+			st.sizes.add(xsz.size, xsz);
 		}
-		ff := ttfsizes.find(xf.id+r);
-		navreply(x, ref dir(x.name, 8r444, big ff.id, len mkdat(ff)), nil);
+		sz := sizes.find(xsz.id+r);
+		navreply(x, ref dir(x.name, sz.id, 8r444, len mkdat(sz), 0), nil);
 
 	Readdir =>
+		dirs := array[] of {ref dirindex()};
+		s := x.offset;
+		if(s > len dirs)
+			s = len dirs;
+		e := x.offset+x.count;
+		if(e > len dirs)
+			e = len dirs;
+		while(s < e)
+			navreply(x, dirs[s++], nil);
 		navreply(x, nil, nil);
 	}
 }
@@ -357,21 +563,40 @@ handle(mm: ref Tmsg)
 	pick m := mm {
 	Read =>
 		ff := srv.getfid(m.fid);
-		if(ff == nil || ff.path == big 0 || !ff.isopen)
+		if(ff == nil || ff.path == big Qroot || !ff.isopen)
 			break;
 
-		path := int ff.path;
-		f := ttfsizes.find(path);
-		if(f == nil)
-			srv.reply(ref Rmsg.Error(m.tag, "ttfsize not found?"));
-		else
-			srv.reply(styxservers->readbytes(m, mkdat(f)));
+		if(ff.path == big Qindex)
+			dat := mkindex();
+		else {
+			f := sizes.find(int ff.path);
+			if(f == nil) {
+				srv.reply(ref Rmsg.Error(m.tag, "size not found?"));
+				return;
+			}
+			dat = mkdat(f);
+		}
+		srv.reply(styxservers->readbytes(m, dat));
 		return;
 	}
 	srv.default(mm);
 }
 
-dir(name: string, mode: int, path: big, length: int): Sys->Dir
+dirroot(): Sys->Dir
+{
+	return dir(".", Qroot, 8r555|Sys->DMDIR, 0, 0);
+}
+
+dirindex(): Sys->Dir
+{
+	mtime := 0;
+	(ok, d) := sys->stat(fontpath);
+	if(ok == 0)
+		mtime = d.mtime;
+	return dir("index", Qindex, 8r444, 0, mtime);
+}
+
+dir(name: string, path, mode, length, mtime: int): Sys->Dir
 {
 	d := sys->zerodir;
 	d.name = name;
@@ -380,10 +605,36 @@ dir(name: string, mode: int, path: big, length: int): Sys->Dir
 	d.qid.qtype = Sys->QTFILE;
 	if(mode&Sys->DMDIR)
 		d.qid.qtype = Sys->QTDIR;
-	d.mtime = d.atime = 0;
+	d.mtime = d.atime = mtime;
 	d.mode = mode;
 	d.length = big length;
 	return d;
+}
+
+strtabitems[T](t: ref Strhash[T]): list of ref (string, T)
+{
+	r: list of ref (string, T);
+	for(i := 0; i < len t.items; i++)
+		for(l := t.items[i]; l != nil; l = tl l)
+			r = ref hd l::r;
+	return r;
+}
+
+tabitems[T](t: ref Table[T]): list of ref (int, T)
+{
+	r: list of ref (int, T);
+	for(i := 0; i < len t.items; i++)
+		for(l := t.items[i]; l != nil; l = tl l)
+			r = ref hd l::r;
+	return r;
+}
+
+find(a: array of string, s: string): int
+{
+	for(i := 0; i < len a; i++)
+		if(a[i] == s)
+			return i;
+	return -1;
 }
 
 suffix(suf, s: string): int
@@ -418,9 +669,12 @@ l2a[T](l: list of T): array of T
 	return a;
 }
 
+fd2: ref Sys->FD;
 warn(s: string)
 {
-	sys->fprint(sys->fildes(2), "%s\n", s);
+	if(fd2 == nil)
+		fd2 = sys->fildes(2);
+	sys->fprint(fd2, "%s\n", s);
 }
 
 say(s: string)
@@ -432,5 +686,6 @@ say(s: string)
 fail(s: string)
 {
 	warn(s);
+	killgrp(pid());
 	raise "fail:"+s;
 }

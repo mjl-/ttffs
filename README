@@ -5,13 +5,15 @@ needs testing.
 
 # intro
 
-ttffs is a styx server, serving ttf files in any size as inferno
-fonts.  the styx serves serves a seemingly empty directory.  but
-walks to files of the form "name.<size>.font" succeed if "name.ttf"
-exists and size is numeric > 1.  the file is a normal inferno font
-and points to subfonts named "name.<size>.<index>", with index a
-numeric index for a glyph range.  these subfonts are also synthesized
-by ttffs on demand.
+ttffs is a 9P2000 server, serving ttf files in any size as inferno/plan
+9 (sub)fonts.  ttffs serves the file "index", returning a listing
+of available fonts.  walks to files of the form
+"<name>.<style>.<size>.font" succeed if a ttf file that matches
+that description (sanitized name, style, size) exists and size is
+numeric > 1.  the file is a normal inferno font and points to
+subfonts named "<name>.<style><size>.<index>", with index a numeric
+index for a glyph range.  these subfonts are also synthesized by
+ttffs on demand.
 
 see the manual page for more information and limitations.
 
@@ -40,7 +42,6 @@ mechiel lukkien, reachable at mechiel@ueber.net.
 
 # todo
 
-- test
-- keep track of fid references to Ttfsizes, and drop cached data when last reference goes
-- see what Face.index means.  perhaps multiple faces in one ttf file?
+- handle fonts that don't have a glyph 0.  should never crash on glyphs with 0 width/height.
 - think of generating glyphs for ranges 0x1-0x1f with ascii names drawn
+- generate smaller ranges for big fonts, otherwise we easily run out of memory.
